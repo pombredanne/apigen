@@ -54,7 +54,7 @@ def command(cli=True, rpc=True):
 
         # wrap func for rpc exception handeling
         def wrapper(*args, **kwargs):
-            if not args[0].apigen_serving:  # cli or python call
+            if args[0]._http_server is None:  # cli or python call
                 return func(*args, **kwargs)
             else:  # rpc call
                 try:
@@ -83,17 +83,41 @@ def command(cli=True, rpc=True):
 
 class Definition(object):
 
-    apigen_serving = False
+    _http_server = None
 
     def get_http_request_handler(self):
         class RequestHandler(pyjsonrpc.HttpRequestHandler):
             methods = _get_rpc_commands(self)
         return RequestHandler
 
+    @command()
+    def version(self):
+        """Returns the current software version!"""
+        # FIXME return something usefull if no __version__ property
+        return _get_version(self)
+
+    def _post_shutdown(self):
+
+        # call stop server handler if exists
+        if('on_shutdown' in dir(self) and
+                callable(self.on_shutdown)):
+            self.on_shutdown()
+
+        # for backwards compatibility
+        elif('on_stop_server' in dir(self) and
+                callable(self.on_stop_server)):
+            print("DEPRECATED on_stop_server! Use on_shutdown instead.")
+            self.on_stop_server()
+
+    def stopserver(self):
+        assert(self._http_server is not None)
+        self._http_server.shutdown()
+        self._post_shutdown()
+
     @command(rpc=False)
-    def startserver(self, hostname="localhost", port=8080, daemon=False):
+    def startserver(self, hostname="localhost", port=8080,
+                    daemon=False, handle_sigint=True):
         """Start json-rpc service."""
-        self.apigen_serving = True
         if daemon:
             print("Sorry daemon server not supported just yet.")
             # TODO start as daemon similar to bitcoind
@@ -101,43 +125,30 @@ class Definition(object):
             print("Starting %s json-rpc service at http://%s:%s" % (
                 self.__class__.__name__, hostname, port
             ))
-            http_server = HTTPServer(
+            self._http_server = HTTPServer(
                 server_address=(hostname, int(port)),
                 RequestHandlerClass=self.get_http_request_handler()
             )
 
-            def sigint_handler(signum, frame):
-                #http_server.shutdown() # FIXME why does it block?
-
-                # call stop server handler if exists
-                if('on_stop_server' in dir(self) and
-                        callable(self.on_stop_server)):
-                    self.on_stop_server()
-
-                sys.exit(0)
-
-            signal.signal(signal.SIGINT, sigint_handler)
-            http_server.serve_forever()
-
-    @command()
-    def stopserver(self, hostname="localhost", port=8080):
-        """Stop json-rpc service."""
-        print("Sorry stop server not supported just yet.")
-        # TODO implement
-
-    @command()
-    def version(self):
-        """Returns the current software version!"""
-        return _get_version(self)
+            if handle_sigint:
+                def sigint_handler(signum, frame):
+                    self._post_shutdown()
+                    sys.exit(0)
+                signal.signal(signal.SIGINT, sigint_handler)
+            self._http_server.serve_forever()
 
 
 def _get_rpc_commands(instance):
-    is_rpc = lambda i: 'apigen_rpc' in dir(i[1]) and i[1].apigen_rpc
+
+    def is_rpc(i):
+        return 'apigen_rpc' in dir(i[1]) and i[1].apigen_rpc
     return dict(filter(is_rpc, inspect.getmembers(instance)))
 
 
 def _get_cli_commands(definition):
-    is_cli = lambda i: 'apigen_cli' in dir(i[1]) and i[1].apigen_cli
+
+    def is_cli(i):
+        return 'apigen_cli' in dir(i[1]) and i[1].apigen_cli
     return dict(filter(is_cli, inspect.getmembers(definition)))
 
 
@@ -172,7 +183,9 @@ def _add_arguments(parser, command):
 def _get_init(definition):
     members = dict(inspect.getmembers(definition))
     init = members["__init__"]
-    if type(init) == type(members["startserver"]):  # __init__ method was added
+
+    # check if __init__ method was added
+    if type(init) == type(members["startserver"]): # NOQA
         # wrap init so _add_arguments works
         def wrapper(*args, **kwargs):
             return init(*args, **kwargs)
@@ -181,7 +194,7 @@ def _get_init(definition):
     return None
 
 
-def _get_arguments(definition):
+def _get_arguments(definition, args):
 
     # create parser
     if definition.__doc__:
@@ -204,7 +217,7 @@ def _get_arguments(definition):
         helptext = command.apigen_src.__doc__
         command_parser = subparsers.add_parser(name, help=helptext)
         _add_arguments(command_parser, command)
-    return vars(parser.parse_args())
+    return vars(parser.parse_args(args=args))
 
 
 def _pop_init_args(definition, kwargs):
@@ -231,11 +244,16 @@ def _deserialize(kwargs):
     return dict(map(deserialize, kwargs.items()))
 
 
-def run(definition):
-    kwargs = _get_arguments(definition)
+def run(definition, args=None):
+    if args is None:
+        args = sys.argv[1:]
+    kwargs = _get_arguments(definition, args)
     kwargs = _deserialize(kwargs)
     instance = definition(**_pop_init_args(definition, kwargs))
     command = getattr(instance, kwargs.pop("command"))
-    result = command(**kwargs)
-    if result:
-        print(json.dumps(result, indent=2, ensure_ascii=False))
+    try:
+        result = command(**kwargs)
+        print(json.dumps(result, indent=2, ensure_ascii=False))  # allow unicode
+    finally:
+        if('on_shutdown' in dir(instance) and callable(instance.on_shutdown)):
+            instance.on_shutdown()
